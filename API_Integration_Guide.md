@@ -5309,6 +5309,106 @@ The mf_purchase simulate endpoint is **NOT available on ONDC** —
 
 ## 21. SIP / Recurring Plan — Complete End-to-End Sequence (ONDC)
 
+### 21.0 SIP FIELD BINDING — frequencies, min/max amount, allowed dates, installments (READ FIRST — app team)
+
+> **App team's exact question:** how to bind the SIP form fields — supported
+> frequencies, min/max amount **per frequency**, allowed installment dates, min
+> installments — and when to show what. **Answer: everything is DATA-DRIVEN from the
+> scheme's `thresholds[]`. Do NOT hardcode any of these — read them per-scheme from the
+> API below.** This mirrors the web frontend exactly (`mutual-fund-invest.component.ts`).
+
+#### Where the data comes from (ONE call)
+```
+GET {mfurl}masterdata/fund-schemes-v2/ONDC/{ISIN}
+→ { ...scheme, thresholds: MfSchemeThreshold[] }
+```
+Example screen: `/app/mutual-funds/invest/INF209K01RU9` → binds from this response.
+
+Web reads the response's `result` (or the object itself) and uses `thresholds`.
+
+#### The `thresholds[]` row shape (bind from THIS — do not invent values)
+```ts
+interface MfSchemeThreshold {
+  type: 'lumpsum' | 'sip' | 'withdrawal';   // filter type==='sip' for SIP
+  frequency?: string;      // sip only: 'monthly' | 'daily' | 'calendar_day_daily' | 'quarterly' | ...
+  amount_min?: number;     // min SIP amount FOR THIS FREQUENCY
+  amount_max?: number;     // max (may be a huge sentinel = "no limit", see below)
+  amount_multiples?: number;   // amount must be a multiple of this (usually 1)
+  installments_min?: number;   // min number_of_installments FOR THIS FREQUENCY
+  dates?: number[];        // ALLOWED installment days (1..28). Empty/missing = all 1..28 allowed
+  // additional_amount_* / units_* also present — not used for SIP create
+}
+```
+
+#### 1. Supported frequencies — from the data, not a fixed list
+- Take every `thresholds` row where `type==='sip'` and `frequency` is set. The DISTINCT
+  `frequency` values are exactly the frequencies this scheme supports. **If a frequency
+  isn't in `thresholds`, the AMC/gateway will reject it — don't offer it.**
+- Order to display (web): monthly first, then dailies, then the rest.
+- Friendly labels the web uses (map `frequency` → label):
+  | `frequency` | Label |
+  |---|---|
+  | `monthly` | Monthly |
+  | `daily` | Daily — Business Days only (skips weekends/holidays) |
+  | `calendar_day_daily` | Daily — Every Calendar Day |
+  | `day_in_a_week` | Weekly |
+  | `day_in_a_fortnight` | Fortnightly |
+  | `twice_a_month` | Twice a month |
+  | `four_times_a_month` | Four times a month |
+  | `quarterly` | Quarterly |
+  | `half_yearly` | Half-yearly |
+  | `yearly` | Yearly |
+  (Unknown value → show the raw frequency string.)
+
+#### 2. Min / Max amount — PER SELECTED FREQUENCY (re-read on frequency change)
+- On frequency select, pick the `thresholds` row for that frequency. Bind:
+  - **min** = `amount_min` (fallback 500 if absent)
+  - **max** = `amount_max` (fallback 999999999)
+  - **multiple** = `amount_multiples` (fallback 1)
+- Daily SIPs often have a much lower min (e.g. ₹40) than monthly (e.g. ₹500) — that's why
+  you MUST re-read per frequency, not once.
+- **"No limit":** gateways return a huge sentinel for max. If `amount_max >= 100000000`
+  (10 crore), show **"No limit"** instead of the 9-digit number.
+
+#### 3. Allowed installment dates (monthly-style frequencies)
+- `dates?: number[]` on the threshold row = the ONLY days (1..28) the scheme allows.
+- If `dates` is present & non-empty → the day picker must **enable only those days**,
+  disable the rest. If empty/missing → all days 1..28 allowed.
+- **Daily frequencies (`daily`, `calendar_day_daily`) have NO installment_day** — omit
+  the day picker entirely; don't send `installment_day` for daily SIPs.
+
+#### 4. Number of installments
+- **min** = the selected frequency row's `installments_min` (fallback 6). Message on
+  violation: *"Minimum {min} installments required for {frequencyLabel}."*
+- **max** = **240** (hard app cap). Message: *"Maximum 240 installments."*
+
+#### 5. Validation rules (exactly what the web enforces — mirror these)
+Amount (on every change, against the SELECTED frequency's row):
+- empty / ≤ 0 → "Amount is required."
+- `< amount_min` → "Minimum SIP is ₹{min}."
+- `> amount_max` → "Maximum is ₹{max}."
+- `amount_multiples > 0 && amount % multiples !== 0` → "Amount must be a multiple of ₹{mul}."
+
+Installments: min = `installments_min`, max = 240 (see #4).
+
+Installment day (monthly): must be in `dates` if `dates` non-empty (else 1..28).
+
+Only enable the **Create Mandate & Start SIP** button when amount + installments + day all
+pass AND the user is invest-ready (see §14.2 / §29.9.1 gate). Then run the DB-driven
+create flow in **§21.2** (register-pending → authorize → poll `sip/status` → finalize).
+
+#### 6. What we send at create (built server-side from the pending row)
+`payment_method: "mandate"`, `payment_source: <mandate old_id>`, `systematic: true`,
+`frequency`, `amount`, `number_of_installments`, `installment_day` (omit for daily),
+`mf_investment_account`, `scheme` (ISIN). `user_ip` is resolved server-side — **don't send it.**
+
+> **Golden rule for the app:** bind frequencies, min/max, multiples, installments_min, and
+> allowed dates **entirely from `thresholds[]`** in the `fund-schemes-v2/ONDC/{ISIN}`
+> response. Re-read the per-frequency row whenever the user changes frequency. Never
+> hardcode ₹500 / 6 / dates — they vary by scheme AND by frequency.
+
+---
+
 Per docs the ONDC plan lifecycle adds extra states beyond the order flow:
 
 ```
