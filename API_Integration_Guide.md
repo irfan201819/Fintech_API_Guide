@@ -2202,6 +2202,32 @@ All wrapper responses use the envelope `{ statusCode, message, result }`. Auth =
   a new file. Web relabels the button "Retry upload →" after a failure. Re-POST the same
   endpoint; no reset/new-form needed.
 
+**Step 7 — eSign: what to open, what to POLL, and when to proceed (app team) — 2026-07-06**
+This is the FINAL step. eSign is Aadhaar-OTP-based via NSDL, done in a browser/WebView.
+- **Open** `kycForm.esign_details.esign_url` (surfaced by the wrapper as `esignUrl` on
+  `GET /kyc/forms/my-status`). If `esignUrl` is null, the form flipped to `awaiting_esign`
+  but the URL isn't populated yet (eventually consistent) → **poll `my-status`** until it
+  appears, then open it. (Web shows "Preparing…" + a refresh button for this.)
+- **After the user finishes eSign in the WebView, DO NOT wait on the NSDL/Cybrilla webhook.**
+  Close the WebView on the deep-link return, then **POLL** `GET /api/kyc/forms/my-status`.
+- **Field to key off — `nextAction` / `kycForm.status` / `esignStatus`:**
+
+  | Poll result | Meaning | App action |
+  |---|---|---|
+  | `esignStatus = successful` AND/OR `kycForm.status = submitted` (nextAction `done`/`wait`) | eSign done, KYC submitted to KRA | **PROCEED** → success screen → Investor Profile. TERMINAL. |
+  | `nextAction = esign` / status still `awaiting_esign` | not signed yet | keep the eSign screen; let the user Open eSign / Refresh. |
+  | `esignStatus = failed` OR `status = failed` | eSign failed | show the reason, **STOP** — let the user retry via Open eSign (re-open the same `esign_url`; re-poll). |
+
+- **Poll cadence:** every ~2–3s for up to ~90s after return; if still `awaiting_esign`, show
+  "still processing — you can come back and resume" (NOT an error — the form is resumable via
+  `?from=resume` / `my-status`). Web has a **"Refresh status"** button on this stage that does
+  exactly this re-pull; the app should implement the same.
+- **Retry:** eSign is retryable — re-open the same `esign_url` and re-poll. No new form needed.
+- **Order of stages before eSign** (so the app knows what precedes it): personal + financial
+  fields filled → Aadhaar via DigiLocker (`fetch_proof`) → signature uploaded
+  (`signature_provided=true`) → THEN `awaiting_esign`. Poll `my-status.nextAction` after each
+  step to know the next stage; never hardcode the order.
+
 **Readiness response example (fresh PAN):**
 ```json
 { "statusCode":200, "result": {
