@@ -5585,13 +5585,45 @@ moves IntentKey+mandate onto the survivor and marks it `active`; else it stamps 
 row. Also stamps `PaymentMethod='mandate'`. Removed the recurring
 `Cannot insert duplicate key … UX_Plan_MfPurchasePlanId / UX_Plan_Idempotency`.
 
-### 21.2d Nomination required BEFORE the SIP create
+### 21.2d Nomination required BEFORE the SIP create — APP TEAM MUST DO THIS
 
 Nominees live on the **MFIA `folio_defaults`** (`nominee1..3`,
-`nominations_info_visibility`), NOT on the SIP request. Finalize VERIFIES the folio has a
-declaration (`show_all_nominee_names` = has nominees, or `show_nomination_status` = opted
-out); if absent → `400 {reason:"nomination_required"}`. Set nominees/opt-out in the
-nomination step first. Fixes the old "add guardian/nominee details" rejection.
+`nominations_info_visibility`), NOT on the SIP request. `sip/finalize` VERIFIES the folio has
+a declaration; if absent → `400 { reason: "nomination_required" }`.
+
+**The three folio states (read `folio_defaults.nominations_info_visibility` from the MFIA):**
+| Value | Meaning | SIP finalize |
+|---|---|---|
+| `show_all_nominee_names` | nominees declared | ✅ passes |
+| `show_nomination_status` | explicitly OPTED OUT | ✅ passes |
+| `null` / missing | **NOT declared yet** (first-time state) | ❌ blocked `nomination_required` |
+
+> ⚠ **`null` ≠ opted out.** An empty nominee list with `null` visibility means the user has
+> NOT made a choice — do not show "opted out". You must make them choose.
+
+**What the APP must do (mandatory — mirrors the web flow):**
+1. **Before letting the user start a SIP on a folio, GET the MFIA** and read
+   `folio_defaults.nominations_info_visibility`.
+2. **If it's `null`/missing → make the user choose** (add nominees OR opt out) in your UI,
+   with an explicit consent tick (SEBI/FP require a declaration for new folios).
+3. **Apply the choice to the folio via a PATCH — the app must send this itself:**
+   - **Opt out:** `PATCH /api/mf/accounts`
+     ```json
+     { "id": "mfia_xxx", "folio_defaults": { "nominations_info_visibility": "show_nomination_status" } }
+     ```
+   - **Add nominees:** attach nominee1..3 + allocations (see the nominee endpoints), which sets
+     `nominations_info_visibility = show_all_nominee_names`.
+   - Values are **case-sensitive**: only `show_all_nominee_names` | `show_nomination_status`.
+4. **THEN call `sip/finalize`.** The guard now passes.
+5. On a `400 { reason: "nomination_required" }` from finalize, route the user back to the
+   nomination choice — the folio's declaration is missing; step 3 wasn't done/didn't stick.
+
+**Verify it stuck:** re-GET the MFIA — `nominations_info_visibility` must be non-null.
+(Confirmed working: PATCH to `show_nomination_status` persists on FP.)
+
+**Nomination is NOT "you must add a nominee" — opting out is a valid, sufficient choice.**
+What's mandatory is the *declaration* (one or the other). Lumpsum (`mf_purchases`) has the
+SAME requirement — apply the folio declaration before the first purchase too.
 
 ### 21.2e SIP Plans list — column contract (API/DB)
 
