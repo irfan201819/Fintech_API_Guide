@@ -2182,6 +2182,26 @@ All wrapper responses use the envelope `{ statusCode, message, result }`. Auth =
 - Constants (`residential_status / country_of_birth / nationality_country / citizenship_countries / tax_residency_other_than_india`) are sent by the wrapper automatically.
 - `geolocation` is **mandatory** — capture it via the explicit "Allow Location" action BEFORE Save (see navigation fixes). FP rejects the form without it.
 
+**Step 6 — Signature upload constraints (ENFORCE ON APP; backend also enforces) — 2026-07-06**
+`POST /api/kyc/forms/{id}/signature` (multipart, field name `file`).
+- **Supported formats: `png`, `jpg`, `jpeg`, `pdf`** (Cybrilla limit).
+- **Max size: 5 MB.**
+- Once uploaded successfully, the form's **`signature_provided` becomes `true`** (mirrored
+  as `signatureProvided` on `GET /kyc/forms/my-status`), and the stage advances to eSign.
+- Validate BOTH on the app (before upload) and rely on the backend as the backstop:
+  - Backend returns **400** `"Unsupported file format. Supported formats: png, jpg, jpeg, pdf."`
+    for a bad format, **400** `"File exceeds 5 MB limit."` for oversize, **400**
+    `"Signature file is required."` for an empty/missing file.
+  - **App must show these validation errors on the upload screen** (a bad file must NOT
+    fail silently). Also show the "Supported formats / max 5 MB" hint up-front.
+- If the upload seems stuck (uploaded but stage didn't advance), re-pull status via
+  `GET /api/kyc/forms/my-status` (web has a "Refresh status" button on this stage).
+- **Retry on failure:** the upload is fully retryable — a failed `POST .../signature` does
+  NOT consume or change the form (it stays in `upload_signature`). The app should keep the
+  selected file, show the error, and let the user tap Upload again (retry same file) OR pick
+  a new file. Web relabels the button "Retry upload →" after a failure. Re-POST the same
+  endpoint; no reset/new-form needed.
+
 **Readiness response example (fresh PAN):**
 ```json
 { "statusCode":200, "result": {
