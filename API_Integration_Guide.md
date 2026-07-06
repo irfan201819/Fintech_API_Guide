@@ -4827,6 +4827,35 @@ Branch on the `nextAction` field:
 | `fix_dob` | DOB mismatch | Re-prompt DOB |
 | `link_aadhaar_at_itd` | PAN-Aadhaar not linked | External CTA to ITD portal |
 
+### 16.4a Input validations at DOB/Name entry — enforce on APP too (2026-07-06)
+
+These run at the **first point** we collect DOB/Name (readiness + pan-validate),
+BEFORE any Cybrilla call. Backend enforces them (authoritative); the **app must
+mirror them client-side** for immediate UX. Web already does.
+
+**1. Age gate — investor must be 18+**
+- Where: `POST /api/pre-verifications/readiness` (when a DOB is supplied) AND
+  `POST /api/pre-verifications/pan-validate` (DOB required).
+- Rule: parse `dateOfBirth`; reject if not a valid date, if in the future, or if age
+  `< 18` today.
+- On fail: **HTTP 400** with message
+  `"You must be at least 18 years old to open a mutual-fund account. Please check your date of birth."`
+- App: validate the DOB picker inline (block Continue + show the message) AND still
+  handle the 400 from the API. Web helper: `isAdultDob(dob)` (age ≥ 18, not future).
+
+**2. Full-name max length — 75 characters**
+- Where: the KYC POA form "Full Name (as per PAN)" field (`kyc-form`), and any name
+  input sent to `pan-validate` / kyc-form create.
+- Rule: **max 75 chars** for the full-name field. Rationale: ITD/KRA cap a printed
+  name at 75 total (25 each for First/Middle/Last). This is a single full-name input,
+  so cap the whole field at 75.
+- Web: `<input [maxlength]="NAME_MAX_LEN">` (NAME_MAX_LEN = 75) + a `createForm()`
+  guard "Name must be 75 characters or fewer." + inline hint when at the limit.
+- App: set the name field `maxLength = 75` and validate before submit.
+
+> Change the limit in ONE place if business updates it (web: `NAME_MAX_LEN` const in
+> `kyc-form.component.ts`). Keep web + app + any backend check in sync.
+
 ### 16.5 Stage 3 is NOT a separate API call
 
 Bank validation (referred to as "Stage 3" in the pre-verification model)
@@ -7364,6 +7393,102 @@ The mobile app reads from `GET /mf/orders/purchase-plans/{mfpp}/installments` to
 
 ---
 
+## 31.4 APP WEBVIEW — how to NOT get stuck (READ THIS) — 2026-07-06
+
+> The single biggest question from the app side: *"we open a WebView URL — do we
+> poll something for the webhook response?"* **Answer: you do NOT wait on the webhook
+> directly. You (a) open the WebView, (b) close it when the WebView is redirected to
+> our deep-link page, then (c) POLL our own status endpoint until it resolves.** The
+> backend has already written the result to the DB from the bank's form-POST (postback),
+> and the Cybrilla webhook is only an authoritative backstop. So polling our DB endpoint
+> is always safe and never hangs.
+
+### The golden rule
+**Never parse the bank's response yourself. Never wait for a Cybrilla webhook in the app.**
+The bank form-POSTs to OUR backend → backend writes status to DB → backend 303-redirects
+the WebView to a deep-link page (`/appmutualfund/mandate` or `/appmutualfund/payment`,
+which fire `islamicly://mf-callback`). The app's only jobs: **detect that deep-link → close
+the WebView → poll our status API.**
+
+### A) SIP — mandate authorization in a WebView
+
+1. Build the pending SIP FIRST (so it's resumable): `POST /api/mf/orders/sip/register-pending`
+   `{ intentKey, mandateId, mfInvestmentAccount, scheme, amount, frequency, installmentDay, numberOfInstallments }`.
+   Generate ONE `intentKey` (uuid) and keep it for the whole flow.
+2. `POST /api/pg/mandates/{id}/authorize?return=invest/<isin>&intent=<intentKey>&source=app`
+   → `{ token_url }`.
+3. Open `token_url` in a WebView.
+4. **Watch the WebView's URL.** When it navigates to a URL that starts with
+   `islamicly://mf-callback` (or reaches `/appmutualfund/mandate?...`), the bank step is
+   done — **close the WebView.** (The redirect carries `status`, `intent`, `reason` in
+   the query — you MAY read them for a fast hint, but they are NOT the source of truth.)
+5. **Poll `GET /api/mf/orders/sip/status/{intentKey}`** every ~2s (cap ~60–90s):
+   - `localStatus == "mandate_approved"` → mandate done → go to step 6.
+   - `localStatus == "mandate_failed"` → show `reason`; offer "Try again" (re-authorize).
+   - `localStatus == "mandate_pending"` (still) → keep polling; after the cap, show
+     "Auto-pay is still processing — you can resume from SIP Plans later" (NOT an error —
+     the pending row survives; §21.2b resume finishes it).
+6. **Finalize the SIP:** `POST /api/mf/orders/sip/finalize/{intentKey}` `{ otp: "" }`
+   → `200 { localStatus:"active", mfPurchasePlanId }` → success screen.
+   Handle finalize errors exactly per §21.2b (`otp_missing` → re-send+verify a fresh OTP;
+   `nomination_required` → nomination screen; `409` → not approved yet, keep polling; `502`
+   → show the parsed `reason`).
+
+**If the user kills the app / WebView mid-flow:** nothing is lost. The pending row exists;
+on next open, `GET /api/mf/orders/purchase-plans/my-list` shows it with `localStatus`
+`mandate_pending`/`mandate_approved` → render a **"Complete SIP"** action that runs the
+same step-5/6 handler (§21.2b). This is the whole point of the DB-driven design.
+
+### B) Lumpsum — payment in a WebView
+
+1. `POST /api/mf/orders/purchases` → `{ mfp_xxx, mfPurchaseId }`; then send-otp / PATCH
+   consent / `POST /api/pg/payments/upi|netbanking` → `{ token_url, paymentId }`;
+   PATCH state=confirmed (see §31.1 for the exact call order).
+2. Open `token_url` in a WebView.
+3. **Watch the WebView URL** for `islamicly://mf-callback?flow=payment` (or
+   `/appmutualfund/payment?...`) → **close the WebView.** Query carries `mfp`, `id`,
+   `status`, `failureCode`, `reason` (advisory only).
+4. **Poll BOTH every ~2s (cap ~90s):**
+   - `GET /api/pg/payments/{paymentId}/snapshot` → `{ status, failureCode, failureReason }`
+     — **payment status is the source of truth.**
+   - `GET /api/mf/orders/purchases/{mfp}/snapshot` → `{ state, folioNumber, allottedUnits,
+     purchasedPrice, failureCode }` — enriches the success card.
+   Outcome matrix + failure-code→message map: see §31.1.
+5. Terminal `APPROVED/SUCCESS` → success; `FAILED/REJECTED` → failure with reason; neither
+   after the cap → "Still processing" (not a hard error) → send them to Transactions.
+
+### Endpoints the app needs (summary)
+| Purpose | Endpoint |
+|---|---|
+| Register pending SIP (first) | `POST /api/mf/orders/sip/register-pending` |
+| Authorize mandate (get WebView URL) | `POST /api/pg/mandates/{id}/authorize?return=…&intent=…&source=app` |
+| **Poll SIP status** | `GET /api/mf/orders/sip/status/{intentKey}` |
+| Finalize SIP | `POST /api/mf/orders/sip/finalize/{intentKey}` |
+| Resume/list SIPs | `GET /api/mf/orders/purchase-plans/my-list` |
+| Start payment (get WebView URL) | `POST /api/pg/payments/upi` or `/netbanking` |
+| **Poll payment** | `GET /api/pg/payments/{paymentId}/snapshot` |
+| **Poll order** | `GET /api/mf/orders/purchases/{mfp}/snapshot` |
+| (Optional backup signal) mandate live | `GET /api/pg/mandates/{id}` |
+
+### Do / Don't
+- ✅ Poll OUR status endpoint after the WebView returns. It's already resolved from the
+  postback; the webhook is just a backstop.
+- ✅ Treat a still-pending state after the timeout as *resumable*, not failed.
+- ✅ Keep ONE `intentKey` across register-pending → authorize → status → finalize.
+- ❌ Don't wait on / subscribe to Cybrilla webhooks from the app.
+- ❌ Don't parse the bank's POST body — you never receive it; the backend does.
+- ❌ Don't send `user_ip` yourself for SIP finalize — the backend resolves a valid IPv4
+  (it rejects `::1`).
+- ❌ Don't block the UI forever if the WebView never returns — cap the poll and offer
+  Resume (SIP) / Go-to-Transactions (lumpsum).
+
+> **Note — SIP create is now DB-driven (§21.2).** The older §31.2 "Phase B" (one-shot
+> `POST /mf/orders/purchase-plans` on the invest page) is superseded for SIP: use
+> register-pending → authorize → poll `sip/status` → `sip/finalize`. Lumpsum (§31.1)
+> is unchanged.
+
+---
+
 ## 31.3 PAN Test Numbers (sandbox)
 
 | PAN | Behavior |
@@ -7627,6 +7752,48 @@ From the Details page the user taps **Invest** → `/app/mutual-funds/invest/{IS
 - **§31** payment/mandate callback pages
 
 *Section 32 end — MF Details page binding/API/formula reference (latest). Invest page = §3.18 + §14.2 + §30 + §31.*
+
+---
+
+# 33. Q&A — App Team Doubts (write here)
+
+> **App team: post your questions in this section instead of pinging over chat.**
+> This file is a shared git repo — add your doubt under "OPEN QUESTIONS", commit, and
+> push. We (API side) will pull, answer inline, move it to "ANSWERED", commit, and push
+> back. That way every question + answer stays in one versioned place and nobody works
+> off a stale paragraph.
+>
+> **How to use (both sides):**
+> 1. `git pull` before editing (so you have the latest).
+> 2. Add/answer your entry.
+> 3. `git add API_Integration_Guide.md && git commit -m "qa: <short note>" && git push`.
+> 4. If git reports a conflict, it's almost always in THIS section — keep both entries
+>    (they're independent lines) and push again.
+>
+> **Format for a new question** — copy this block, fill it in, put it under OPEN QUESTIONS:
+> ```
+> ### Q<n> — <one-line title>
+> - **Asked by:** <name> · <date>
+> - **Context:** <screen / endpoint / section ref, e.g. §21.2 SIP finalize>
+> - **Question:** <what you need to know>
+> - **What you tried / error:** <exact request + response/error, if any>
+> ```
+
+## OPEN QUESTIONS
+
+<!-- App team: add new questions below this line. Newest at the top. -->
+
+### Q1 — (example — replace me)
+- **Asked by:** _App team_ · _YYYY-MM-DD_
+- **Context:** _§21.2 SIP finalize_
+- **Question:** _e.g. "After the mandate WebView returns, how long should we poll `sip/status` before showing 'still processing'?"_
+- **What you tried / error:** _paste the exact request + the response/error here_
+
+## ANSWERED
+
+<!-- API side moves resolved items here with the answer appended. -->
+
+_(none yet)_
 
 ---
 
