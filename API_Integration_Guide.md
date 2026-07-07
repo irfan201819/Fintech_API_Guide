@@ -5594,6 +5594,43 @@ has `intentKey`, no `mfPurchasePlanId`) — re-enter at Step 4 (re-authorize) or
 
 **Do NOT send `user_ip` yourself for finalize** — the backend resolves a valid IPv4 (it rejects `::1`).
 
+### 21.1b 🔧 TROUBLESHOOTING — `sip/status` stuck on `mandate_pending` forever
+
+This is the #1 issue. `localStatus` flips `mandate_pending → mandate_approved` ONLY when
+BillDesk's **server-to-server postback** reaches our backend after the user authorizes the
+mandate. Polling never advances it. Work through this checklist IN ORDER:
+
+**APP-SIDE (most common cause):**
+1. **Did you call the authorize step?** After register-pending you MUST:
+   `POST /api/pg/mandates/{mandateId}/authorize?isWeb=0&intent=<intentKey>&source=app`
+   → open the returned `token_url` in the WebView so the user approves at the bank.
+   register-pending + polling ALONE loops forever.
+2. **Did you pass `intent=<intentKey>` on that authorize call?** This is how the postback
+   links BillDesk's callback to your pending SIP row. Missing `intent` → the backend
+   receives the callback but can't resolve the row → stays `mandate_pending`.
+3. **The WebView "success" you see is the browser REDIRECT, not the DB update.** The DB
+   flip depends on BillDesk's separate server POST reaching our backend. Don't treat the
+   WebView redirect as "done" — poll `sip/status` and wait for `mandate_approved`.
+4. **Is the mandate actually APPROVED at the gateway?** `GET /api/pg/mandates/{id}` →
+   `mandate_status`. If it's still `CREATED`/`SUBMITTED`, the user didn't finish the bank
+   authorization — nothing will flip.
+
+**BACKEND-SIDE:**
+5. **Is the postback URL reachable?** The backend tells BillDesk to POST the result to
+   `Finprim:Postback:{Web|App}:Mandate` (appsettings). If that host is a **stale ngrok
+   tunnel** (ngrok changes URL on every restart) or otherwise unreachable, BillDesk posts
+   into a dead URL, `MandatePostbackController.Postback` NEVER runs, and the row is never
+   flipped. **Symptom: register-pending + polling both 200, mandate approved at bank, but
+   status stuck.** Fix: point the postback URL at the CURRENT reachable public host of the
+   API. **On UAT/prod use a STABLE host (e.g. `https://fintechuat.islamicly.com/api/pg/
+   mandates/postback?source=app`), never a throwaway ngrok tunnel.**
+6. The postback flips the row synchronously; the `mandate.*` WEBHOOK is only a backstop.
+   So a stuck status is almost always #1–#5, not "the webhook didn't fire".
+
+**Quick DB check (support):** `SELECT LocalStatus, MandateId FROM tbl_Fintech_MF_Purchase_Plan
+WHERE IdempotencyKey='<intentKey>'` — if `mandate_pending` while the bank shows approved,
+the postback didn't reach us (checklist #2 or #5).
+
 ---
 
 ### 21.2 SIP create flow — DB-DRIVEN & RESUMABLE (CURRENT — 2026-07-06 rework)
