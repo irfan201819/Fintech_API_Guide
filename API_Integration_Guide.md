@@ -5510,6 +5510,92 @@ A SIP needs a `payment_source` which is the numeric `old_id` of an
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 21.1a ⭐ FULL SIP FLOW — EVERY CALL IN ORDER (incl. OTP) — APP TEAM: FOLLOW EXACTLY
+
+> This is the complete, copy-followable sequence. Do the steps IN THIS ORDER. The
+> #1 support issue is skipping a step (usually the **mandate authorize** step) and
+> then polling `sip/status` forever while it stays `mandate_pending`. **Polling only
+> READS state — it never advances anything. The mandate authorization (WebView) is
+> what flips the status.** All SIP endpoints are under `api/mf/orders`.
+>
+> Generate ONE `intentKey` (uuid) at the start and reuse it for EVERY step below.
+
+```
+STEP 0  Prereq: an APPROVED mandate exists (mandate.old_id = payment_source). See §21.1.
+        You need the mandate's numeric id (e.g. 115) for the authorize + register-pending.
+
+STEP 1  Send consent OTP (UP-FRONT — before the mandate WebView)
+        POST /api/mf/orders/purchase-plans/send-otp
+        Header:  Plan-Intent-Key: <intentKey>
+        Body:    { "mobile": "<user mobile>", "email": "<user email>", "isdCode": "+91" }
+        → 200 { intentKey, expiresAt, channel, sandboxOtp?:"123456" }   (sandbox echoes the OTP)
+
+STEP 2  Verify OTP (peek — does NOT consume it)
+        POST /api/mf/orders/purchase-plans/verify-otp
+        Header:  Plan-Intent-Key: <intentKey>
+        Body:    { "otp": "<user-entered otp>" }
+        → 200 { valid: true }
+        (The OTP is CONSUMED later at finalize, keyed by intentKey — the app never resends it.)
+
+STEP 3  Register the PENDING plan row (creates the resumable DB row FIRST)
+        POST /api/mf/orders/sip/register-pending
+        Body:  { "intentKey":"<intentKey>", "mandateId":"115",
+                 "mfInvestmentAccount":"mfia_xxx", "scheme":"<ISIN>",
+                 "amount":500, "frequency":"monthly", "installmentDay":7,
+                 "numberOfInstallments":12 }
+        → 200 { localStatus: "mandate_pending" }
+        (installmentDay omitted for daily/calendar_day_daily frequencies.)
+
+STEP 4  ⚠ AUTHORIZE THE MANDATE  — THE STEP MOST OFTEN MISSED
+        POST /api/pg/mandates/{mandateId}/authorize?isWeb=0&intent=<intentKey>&source=app
+        Body:  {}                         (backend fills the postback URL)
+        → 200 { token_url }
+        Then: OPEN token_url in a WebView. The user approves the e-mandate at the bank.
+        - isWeb=0 for the app (postback returns to the app deep link, not the web page).
+        - intent=<intentKey> lets the postback resolve THIS pending SIP.
+        Bank → posts back to our backend → backend flips the pending row:
+             success  → localStatus = mandate_approved
+             fail     → localStatus = mandate_failed
+        App: watch the WebView URL for  islamicly://mf-callback  → then CLOSE the WebView.
+        (Do NOT wait on the Cybrilla webhook — the postback already updated the DB.)
+
+STEP 5  Poll status (ONLY meaningful AFTER Step 4 returns)
+        GET /api/mf/orders/sip/status/<intentKey>
+        Poll every ~2–3s, cap ~60–90s. React to localStatus:
+             mandate_approved  → go to Step 6
+             mandate_failed    → show reason; let user retry the mandate (Step 4 again)
+             mandate_pending   → keep polling; after the cap, show "still processing —
+                                 resume later from SIP Plans" (NOT an error; the row survives)
+
+STEP 6  Finalize — create the SIP at Cybrilla
+        POST /api/mf/orders/sip/finalize/<intentKey>
+        Body:  { "otp": "" }              (empty — the up-front OTP is consumed by intentKey)
+        → 200 { localStatus:"active", mfPurchasePlanId:"mfpp_xxx", plan:{...} }
+        Finalize error handling:
+             400 reason="otp_missing"        → up-front OTP gone → re-send+verify a FRESH OTP
+                                               (repeat Steps 1–2), then call finalize with that otp.
+             400 reason="nomination_required"→ folio has no nomination declaration → make the
+                                               user add nominees OR opt out (§21.2d), then retry.
+             409 mandate not approved        → status wasn't mandate_approved yet → poll again.
+             502 { reason }                  → surface the provider reason verbatim.
+
+STEP 7  Success → show the SIP (Fund, amount/frequency, installments, mfPurchasePlanId).
+```
+
+**"My poll never returns / stuck on mandate_pending" → you skipped Step 4.** register-pending
++ polling alone will loop forever. The mandate MUST be authorized (Step 4 WebView) and the
+bank must post back before `sip/status` can leave `mandate_pending`. Also confirm the mandate
+itself is APPROVED on the gateway (`GET /api/pg/mandates/{id}` → `mandate_status`); if it's
+still CREATED/SUBMITTED, the user didn't finish the bank authorization.
+
+**Resume (app killed mid-flow / mandate_failed):** the pending row persists. On reopen,
+`GET /api/mf/orders/purchase-plans/my-list` shows it (`localStatus` mandate_pending/approved,
+has `intentKey`, no `mfPurchasePlanId`) — re-enter at Step 4 (re-authorize) or Step 6 (finalize).
+
+**Do NOT send `user_ip` yourself for finalize** — the backend resolves a valid IPv4 (it rejects `::1`).
+
+---
+
 ### 21.2 SIP create flow — DB-DRIVEN & RESUMABLE (CURRENT — 2026-07-06 rework)
 
 > **This SUPERSEDES the one-shot "create the plan directly" flow shown in 21.2-LEGACY
