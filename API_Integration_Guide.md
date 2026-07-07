@@ -8056,6 +8056,56 @@ From the Details page the user taps **Invest** → `/app/mutual-funds/invest/{IS
 
 ---
 
+# 32.8 REPORTS (Transactions → Reports tab) — APP TEAM: IMPLEMENT SAME AS WEB
+
+The web Transactions page has a **Reports** tab. Every report is a **PDF download**
+from ONE endpoint family, built server-side from our snapshot tables and **scoped to
+the logged-in user** (auth required — send the JWT).
+
+## Endpoint (all reports)
+```
+GET /api/mf/reports/{path}[?from=yyyy-MM-dd&to=yyyy-MM-dd | ?fy=<year>]
+Response: 200, Content-Type: application/pdf   (a PDF byte stream — download it)
+Auth: Bearer <jwt>   (report is scoped to that user)
+```
+App: request as a binary/blob, save/open as a PDF file (name it `{path}_{yyyy-MM-dd}.pdf`).
+On error the body carries `{ message }` — show it.
+
+## The reports to render (exact set the web shows)
+| Card title | `{path}` | Params | Notes |
+|---|---|---|---|
+| **Account Statement** | `account-statement` | `?from=&to=` (both optional; omit = full history) | date-range picker |
+| **Annual Portfolio Summary** | `annual-portfolio-summary` | `?fy=<startYear>` (e.g. `fy=2025` = FY 2025-26, Apr 2025–Mar 2026) | FY dropdown: current + 5 prior FYs |
+| **SIP Summary & Due** | `sip` | none | per-SIP installments, current value, pending installments |
+| **Holding Statement** | `holding-statement` | none | units, avg cost, latest NAV, current value, gain/loss |
+| **Unrealised Gain/Loss** | `unrealised-gain-loss` | none | mark-to-market: (current NAV − cost) × units |
+| **Nominee Report** | `nominee` | none | registered nominees + relationship + allocation % |
+
+**FY picker logic (match web):** default FY start = `month >= April ? currentYear : currentYear-1`;
+options = that start year and the 5 prior years. Send the START year as `fy`.
+
+**Date pickers:** `from`/`to` are `yyyy-MM-dd`, `max` = today. Both optional — omit for full history.
+
+## ⚠ Important notes
+- **Dividend Report is NOT live.** The web still lists a "Dividend Report" card, but the
+  backend `GET /api/mf/reports/dividend` endpoint is **commented out** → it will 404.
+  **Do NOT add a Dividend report card in the app** until the backend enables it.
+- Reports are built from OUR local snapshot tables (kept fresh by webhooks/sync), NOT a
+  live Cybrilla call — so they reflect whatever we've synced. If a just-placed order isn't
+  in a report yet, sync/refresh first.
+- These are the **only** report paths the backend serves today: `account-statement`,
+  `annual-portfolio-summary`, `sip`, `holding-statement`, `unrealised-gain-loss`, `nominee`.
+  Any other `{path}` → 404.
+
+## App implementation checklist
+1. Render the 6 report cards above (NOT dividend).
+2. Account Statement → date-range inputs (optional). Annual Summary → FY dropdown.
+3. On tap → `GET /api/mf/reports/{path}` with the JWT → receive the PDF blob → open/share
+   it (native PDF viewer / share sheet). Show a spinner while generating.
+4. Handle non-200: show the `message` from the error body.
+
+---
+
 # 33. Q&A — App Team Doubts (write here)
 
 > **App team: post your questions in this section instead of pinging over chat.**
