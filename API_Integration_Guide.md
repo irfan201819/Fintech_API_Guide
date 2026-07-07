@@ -5545,6 +5545,12 @@ STEP 3  Register the PENDING plan row (creates the resumable DB row FIRST)
                  "numberOfInstallments":12 }
         → 200 { localStatus: "mandate_pending" }
         (installmentDay omitted for daily/calendar_day_daily frequencies.)
+        ── payment_source note (2026-07-07): send mandateId ONLY. For a SIP the
+           payment_source IS the mandate's numeric old_id, so the backend DERIVES
+           payment_source from mandateId — do NOT send a separate "paymentSource".
+           (Earlier a missing payment_source caused finalize to 400 with "Missing
+           mandate payment source"; the backend now defaults it from mandateId at
+           register-pending AND falls back to it at finalize. Nothing to change app-side.)
 
 STEP 4  ⚠ AUTHORIZE THE MANDATE  — THE STEP MOST OFTEN MISSED
         POST /api/pg/mandates/{mandateId}/authorize?isWeb=0&intent=<intentKey>&source=app
@@ -5576,6 +5582,11 @@ STEP 6  Finalize — create the SIP at Cybrilla
                                                (repeat Steps 1–2), then call finalize with that otp.
              400 reason="nomination_required"→ folio has no nomination declaration → make the
                                                user add nominees OR opt out (§21.2d), then retry.
+             400 "Missing mandate payment source" → BACKEND: the pending row had no payment_source.
+                                               Fixed 2026-07-07 (backend derives it from mandateId at
+                                               register-pending + falls back at finalize). App does NOT
+                                               send paymentSource — just mandateId at Step 3. If you still
+                                               see this, the API needs the redeploy of that fix.
              409 mandate not approved        → status wasn't mandate_approved yet → poll again.
              502 { reason }                  → surface the provider reason verbatim.
 
