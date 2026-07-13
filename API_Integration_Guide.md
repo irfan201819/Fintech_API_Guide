@@ -8,6 +8,99 @@ This document is the single-source contract for the **end-to-end onboarding flow
 
 ---
 
+## ⭐ APP TEAM — Tax Residency (FATCA / CRS) Step — Build It Exactly Like the Web
+
+> Quick, self-contained spec for the App team to reproduce the **FATCA / CRS
+> Tax Residency** screen (the last onboarding step before MF Account) exactly as
+> the web client does it. Web reference:
+> `IslamiclyWebLatest/src/app/features/mutual-funds/onboarding/onboarding.component.ts`
+> (`submitDematAndFatca()`), DTO `src/app/services/kyc.service.ts` (`CreateFatcaPayload`).
+
+### Screen title / copy (match the web)
+- Title: **"Tax Residency (FATCA / CRS)"**
+- Subtitle: *"Required by SEBI — your Indian PAN is automatically set as your primary tax residency"*
+- Info note: *"Mutual funds collect tax residency information to report to the Income Tax Department (ITD)… Your PAN will automatically be used as your Indian tax ID."*
+
+### Inputs on the screen
+
+**1. PEP — "Are you a Politically Exposed Person (PEP)?"  *(required)***
+Three options. Send the *value*, not the label. This is the **investor-profile**
+`pep_details` enum (NOT the KYC-form enum — see enum appendix):
+
+| Button label   | Value to send (`pep_details`) |
+| -------------- | ----------------------------- |
+| Not Applicable | `not_applicable`              |
+| PEP            | `pep_exposed`                 |
+| Related to PEP | `pep_related`                 |
+
+> If the user already answered PEP in the fresh-KYC step, the web pre-fills this
+> and hides it. App team may pre-fill from `kyc/forms/my-status` → `kycPepDetails`
+> and map: `pep→pep_exposed`, `related_pep→pep_related`, `no_exposure→not_applicable`.
+
+**2. "Are you a tax resident in any country other than India?"  *(Yes / No)***
+- **No** → submit with `has_non_indian_tax_residency: false`, no `foreign_residencies`.
+  India/PAN is set automatically as the primary residency **server-side** — the
+  user never enters it.
+- **Yes** → show the foreign-residency repeater below.
+
+**3. Foreign Tax Residency repeater (only when "Yes")** — add **1 to 3** entries.
+Each entry has **3 fields, all required**:
+
+| Field           | Input type              | Accepted values / format |
+| --------------- | ----------------------- | ------------------------ |
+| **Country Code**  | text, auto-UPPERCASE    | 2-letter ISO code (e.g. `US`, `GB`, `SG`, `AE`). Must be **unique** across entries. Must not be `IN`. |
+| **Tax ID Type**   | dropdown                | `tin` \| `ssn` \| `pan` \| `other` (default `tin`) |
+| **Tax ID Number** | text                    | free text, per-country format |
+
+- Repeater max = **3** foreign residencies (FP exposes `second/third/fourth_tax_residency`).
+- Show **"+ Add another country"** while count < 3; each extra row gets **Remove**.
+
+### Client-side validation (do these BEFORE calling the API — same as web)
+1. Each entry's **Country Code** required → else *"Please enter the country code for residency N."*
+2. Each entry's **Tax ID Number** required → else *"Please enter the tax ID number for residency N."*
+3. **No duplicate countries** → else *"Duplicate country 'XX' — each tax residency must be a different country."*
+4. Trim + uppercase the country code; default `taxid_type` to `tin` if empty.
+5. **Never send dates** — FP rejected `applicable_from`/`applicable_to` with a
+   400 JSON-parse error (2026-06-18). Only `country` / `taxid_type` / `taxid_number`.
+
+### API call
+`POST {mfurl}onboarding/fatca`  (web: `MfPurchase`/kyc.service → FinprimApi `OnboardingController.SubmitTaxResidency`)
+
+Request body (`CreateFatcaPayload`):
+```json
+{
+  "investor_profile": "<investor profile id>",
+  "pep_details": "not_applicable",
+  "has_non_indian_tax_residency": true,
+  "foreign_residencies": [
+    { "country": "US", "taxid_type": "ssn", "taxid_number": "123-45-6789" },
+    { "country": "GB", "taxid_type": "tin", "taxid_number": "GB999999999" }
+  ]
+}
+```
+- Omit `foreign_residencies` entirely (or send `[]`) when `has_non_indian_tax_residency` is `false`.
+- Backend forwards to Cybrilla `PATCH /v2/investor_profiles`, mapping the array to
+  `second_/third_/fourth_tax_residency`; `first_tax_residency` = `{country:"IN", taxid_type:"pan", taxid_number:<PAN>}` is set automatically.
+
+### Sample valid payloads
+No foreign residency:
+```json
+{ "investor_profile":"<id>", "pep_details":"not_applicable", "has_non_indian_tax_residency": false }
+```
+One foreign residency:
+```json
+{ "investor_profile":"<id>", "pep_details":"not_applicable", "has_non_indian_tax_residency": true,
+  "foreign_residencies":[ { "country":"US", "taxid_type":"ssn", "taxid_number":"123456789" } ] }
+```
+
+### On success / failure
+- **Success** → advance to the **MF Account** step (web: `currentStep = 'mf-account'`).
+- **Failure** → show `err.error.message` (backend surfaces the real Cybrilla error).
+
+_See §3 (endpoint reference) and §6 (enum appendix: `pep_details` two enums + `taxid_type`) for the full contract._
+
+---
+
 ## 0. 📋 How to Use This Guide (especially when pasted into Claude)
 
 This file is the **single source of truth** for the Islamicly Mutual Fund onboarding integration that wraps Cybrilla Fintech Primitives.
