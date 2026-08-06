@@ -8,6 +8,148 @@ This document is the single-source contract for the **end-to-end onboarding flow
 
 ---
 
+## 🚨 APP TEAM — 2026-08-06 Changes You MUST Handle
+
+> Four backend changes went in on **2026-08-06**. Two of them are **breaking for
+> the app if it trusts `nextAction` blindly**, one changes what "verified" means,
+> and one is a UI/UX correction. Read all four before your next release.
+
+---
+
+### 1. `nextAction` on a FAILED KYC form now has NEW values ⚠ BREAKING
+
+**Endpoints:** `GET /api/kyc/forms/my-status` and `GET /api/kyc/forms/{id}/poll`
+
+**What was wrong:** the backend mapped `nextAction` from `status` alone, so
+**every** failed form returned `start_fresh_kyc` — even when the failure reason
+was `ineligible_for_fresh_kyc`, which literally means *"this PAN already has a
+KRA record, a fresh KYC is not allowed"*. A client that obeyed `nextAction` would
+loop forever: start fresh → instant fail (same reason) → start fresh → …
+
+**What changed:** `nextAction` is now derived from `reason` when
+`status == "failed"`:
+
+| `reason` | `nextAction` (NEW) | was |
+| --- | --- | --- |
+| `ineligible_for_fresh_kyc` | **`start_modify_kyc`** | ~~`start_fresh_kyc`~~ |
+| `ongoing_form_exists` | **`resume_form`** | ~~`start_fresh_kyc`~~ |
+| anything else | `start_fresh_kyc` | `start_fresh_kyc` *(unchanged)* |
+
+`status = "expired"` still returns `start_fresh_kyc`. Non-failed statuses are
+untouched.
+
+**What the app must do:**
+
+- **`start_modify_kyc`** — do **NOT** create a fresh form. The PAN already has a
+  KRA record. Call `GET /api/pre-verifications/my-status`:
+  - `readiness.status == "verified"` → the user is already KYC-compliant. Send
+    them to invest; no KYC form at all.
+  - readiness is modify-eligible (`successful` / `validated` / `verified` /
+    `registered` / `onhold`, or `code == "kyc_incomplete"`, or
+    `nextAction == "start_modify_kyc"`) → create a **modify** form.
+  - anything else → **stop**. Show "your KYC exists at the registry but isn't
+    confirmed as updatable yet — try again later or contact support". Do **not**
+    auto-create either type: **a wrong modify LOCKS THE PAN FOR 7 DAYS.**
+- **`resume_form`** — a form is already in flight. Resume it. Do not create a
+  second one.
+
+> ⚠ If your code has a `switch (nextAction)` with no `default`, these two new
+> values will fall through and the screen will do nothing. Add handling before
+> this ships.
+
+---
+
+### 2. Contact OTP — "verified" now means genuinely verified 🔐 SECURITY
+
+**Endpoint:** `GET /api/onboarding/contact/verified-status`
+
+**What was wrong:** the backend inferred "verified" from an internal
+`ConsumedAt` timestamp that is **also** written when an OTP is merely
+*superseded*, *expired*, or *locked out*. Net effect: **pressing "Resend OTP"
+twice marked the contact verified** without the user ever entering a code.
+Reproduced with a real user: 2 send-otp calls, 0 verify calls → API returned
+`phoneVerified: true`.
+
+**What changed:** a dedicated `VerifiedAt` marker is now stamped **only** when a
+correct code is entered, and the status endpoint reads that.
+
+**What the app must expect:**
+
+- `emailVerified` / `phoneVerified` will now be **`false`** in cases where they
+  used to be (incorrectly) `true`. This is the fix, not a regression.
+- **Some existing users will be un-verified** by a one-time data correction and
+  will be asked to verify again. Do not treat that as an error state.
+- Never treat "OTP sent" as "OTP verified". Always require the verify call.
+
+**Response shape is unchanged** — only the truthfulness of the two booleans.
+
+---
+
+### 3. `GET /api/onboarding/user-details` — 500 fixed (new-DB only)
+
+**What was wrong:** the endpoint returned
+`500 SqlException: Invalid object name 'tbl_ri_logins'` when the API pointed at
+the new database — that table only exists in the legacy DB.
+
+**What changed:** the stored procedure now reads the new registration table.
+**Response contract is unchanged** (`email`, `name`, `mobile`, `pan`,
+`dateOfBirth`), so no app change is required.
+
+**What the app should know:** `pan` and `dateOfBirth` can legitimately come back
+`null` when the user has no **approved** KYC record. The KYC start screen must
+handle empty PAN/DOB and let the user type them (this was already the intended
+behaviour — just be aware `null` is normal, not a failure).
+
+---
+
+### 4. "Still requires these fields" error after saving KYC details — now suppressed
+
+**Endpoint:** `PATCH /api/kyc/forms` (fill-fields step)
+
+**What was wrong:** the provider's `fields_needed` list is **eventually
+consistent** — a `GET` immediately after a successful `PATCH` can still echo the
+*pre-patch* list. The web app was surfacing that as:
+
+> *"The KYC provider still requires: email_address, phone_number, gender, …,
+> geolocation. Please fill these and save again."*
+
+…even though the save had **succeeded** and the form was complete. The advice was
+both wrong and impossible to act on.
+
+**What changed (web reference implementation):** after the PATCH we re-read up to
+3 times, then compare the still-needed list against the keys we actually sent:
+
+- Fields in the list that we **did** send → stale echo → **show nothing**, stay
+  silent, let the poller advance the stage.
+- Fields we did **not** send → show an error listing **only those**.
+- `father_name` / `spouse_name` are mutually exclusive (marital status decides
+  which one is sent), so the omitted one is never reported as missing.
+
+**What the app must do:** implement the same comparison. Do **not** render the
+provider's raw `fields_needed` straight to the user after a successful PATCH —
+you will scare users with a list of fields they just filled in.
+
+---
+
+### Related backend note (no app action)
+
+The app's "Re-check readiness" / "Refresh status" buttons must **re-run** the
+registry readiness check (`POST /api/pre-verifications/readiness` then poll
+`GET /api/pre-verifications/{id}/poll`), **not** just re-read
+`GET /api/pre-verifications/my-status`.
+
+A stored pre-verification row is a **point-in-time snapshot**. If readiness was
+run *before* the KYC form was submitted, that row stays
+`failed / kyc_unavailable` **forever** — re-reading it can never clear, so the
+invest gate (fail-closed on `readiness == "verified"`) locks the user out
+permanently. Verified on production: a *new* readiness check returned `verified`
+within seconds while the stored row still said `kyc_unavailable`.
+
+A newly created readiness row automatically becomes the "latest" one that every
+later buy-time check (invest / SIP / redemption) reads, so no cleanup is needed.
+
+---
+
 ## ⭐ APP TEAM — Tax Residency (FATCA / CRS) Step — Build It Exactly Like the Web
 
 > Quick, self-contained spec for the App team to reproduce the **FATCA / CRS
