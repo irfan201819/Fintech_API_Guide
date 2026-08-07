@@ -8,6 +8,99 @@ This document is the single-source contract for the **end-to-end onboarding flow
 
 ---
 
+## 🚨 APP TEAM — 2026-08-07 · Cybrilla deprecated `order_gateway` (Orders & Plans APIs)
+
+> **Deadline: 10 August 2026, after market hours (Production).**
+> Sandbox already enforced this on **30 July 2026** — if your sandbox SWP /
+> plan create started failing, this is why.
+
+### What Cybrilla changed
+
+The Orders and Plans APIs used to accept **both** `order_gateway` and `gateway`
+in the request body. `order_gateway` is now **deprecated and rejected**.
+
+Verified live against sandbox on 2026-08-07:
+
+```
+POST /v2/mf_redemption_plans   { ..., "order_gateway": "rta" }
+  → 400  {"field":"order_gateway","message":"deprecated, use gateway instead"}
+
+POST /v2/mf_redemption_plans   { ..., "gateway": "rta" }
+  → deprecation error GONE (field accepted)
+```
+
+### Do you need to change anything? — Per-flow audit
+
+Audit of the Islamicly wrapper (`FinprimApi`) as of 2026-08-07:
+
+| Flow | Wrapper endpoint | Upstream | Gateway we send |
+| --- | --- | --- | --- |
+| **Buy** (lump-sum) | `POST /api/mf/orders/purchases` | `POST /v2/mf_purchases` | **none** — omitted |
+| **SIP** (purchase plan) | `POST /api/mf/orders/sip/finalize/{intentKey}` | `POST /v2/mf_purchase_plans` | **none** — omitted |
+| **Sell** (one-time redemption) | `POST /api/mf/orders/redemptions` | `POST /v2/mf_redemptions` | **none** — omitted |
+| **SWP** (redemption plan) | `POST /api/mf/orders/redemption-plans` | `POST /v2/mf_redemption_plans` | **`gateway: "rta"`** (stamped server-side) |
+
+**Buy / SIP / Sell send NO gateway at all** — by design. Cybrilla derives the
+gateway from the scheme (purchases/plans) or the folio (redemptions). That is
+the correct behaviour and is unaffected by this deprecation.
+
+**SWP is the only flow that sends one.** The wrapper stamps it server-side; the
+client never supplies it.
+
+### ✅ ACTION REQUIRED FOR THE APP TEAM
+
+1. **Search your codebase for `order_gateway`.** If you send it in ANY request
+   body — Buy, SIP, Sell, SWP, Switch, or Settlement — rename the JSON key to
+   **`gateway`**. Same value, same position in the body; only the key changes.
+2. **If you send no gateway on Buy / SIP / Sell — do nothing.** Keep omitting it.
+   Do **not** "helpfully" start sending one; letting Cybrilla resolve it from the
+   scheme/folio is intentional.
+3. **Do not send `gateway` on Buy / SIP / Sell** just because the field exists.
+   An explicit wrong value fails the order; omission cannot.
+4. Validate in **Sandbox** before 10 Aug. Sandbox already rejects
+   `order_gateway`, so a passing sandbox run proves you are clean.
+
+> **Note for anyone reading old sections of this guide:** §3.18.6, §3.19 and the
+> gateway-selection tables further down still say `order_gateway="rta"` for SWP.
+> That wording is **superseded by this section** — the field is now `gateway`.
+
+### ⚠ Separate pre-existing issue this surfaced — SWP is not usable on our tenant
+
+While validating, we probed which `gateway` values our tenant accepts on
+`/v2/mf_redemption_plans`:
+
+| `gateway` value | Result |
+| --- | --- |
+| `"rta"` | ❌ `{"field":"gateway","message":"order gateway not supported"}` |
+| `"RTA"` | ❌ same |
+| `"ondc"` | ✅ accepted as a field value |
+
+So our ONDC tenant **cannot use `rta`** — but Cybrilla's docs state *"For ondc as
+gateway, currently only MF Purchase plans are supported"*, i.e. SWP is **not
+supported on `ondc`** either. SWP is therefore a dead end on this tenant today,
+which matches the existing note in §3.19 (*"SWP works only on RTA-enabled
+schemes — which we don't have, hence it stays hidden"*).
+
+**This is NOT caused by the rename** — it pre-dates it. The rename only means
+SWP now fails with an honest "not supported" instead of a deprecation warning.
+Since SWP is hidden in the UI, current user impact is **zero**.
+
+App team: keep SWP hidden. Do not build the SWP screen against this endpoint
+until Cybrilla confirms `rta` is enabled for tenant `islamiclyondc`.
+
+### Wrapper changes made (for reference — no app impact)
+
+| File | Change |
+| --- | --- |
+| `Models/Mf/MfPurchasePlanModels.cs` | `CreateMfRedemptionPlanRequest`: `[JsonPropertyName("order_gateway")] Order_Gateway` → `[JsonPropertyName("gateway")] Gateway` |
+| `Controllers/MfOrdersController.cs` | `request.Order_Gateway = "rta"` → `request.Gateway = "rta"` |
+| `Models/Mf/MfOrderModels.cs` | Removed the **dead** `order_gateway` property from `CreateMfPurchaseRequest` (declared but never assigned, so it never serialized) |
+
+Wrapper response contracts are **unchanged**. `order_gateway` no longer appears
+anywhere in the wrapper's outbound payloads.
+
+---
+
 ## 🚨 APP TEAM — 2026-08-06 Changes You MUST Handle
 
 > Four backend changes went in on **2026-08-06**. Two of them are **breaking for
